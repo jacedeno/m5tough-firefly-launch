@@ -1,11 +1,12 @@
 # Firefly Launch Display
 
-A desk display for the **M5Stack M5Tough** that shows the next **Firefly Aerospace** rocket launch with a live T-minus countdown. Launch data comes from [The Space Devs Launch Library 2](https://thespacedevs.com/llapi) API.
+A desk display for the **M5Stack M5Tough** that shows the next **Firefly Aerospace** rocket launch with a live T-minus countdown, styled in Firefly's brand green. Launch data comes from [The Space Devs Launch Library 2](https://thespacedevs.com/llapi); weather from [Open-Meteo](https://open-meteo.com/).
 
-The screen alternates between two views every 8 seconds, and you can tap the touchscreen to switch instantly:
+The screen alternates between three views every 8 seconds, and you can tap the touchscreen to switch instantly:
 
-- **Mission Control** — telemetry-style layout (orange on black): big countdown plus mission, rocket, pad, site and orbit.
+- **Mission Control** — telemetry-style layout: big countdown plus mission, rocket, pad, site and orbit.
 - **Hero** — the mission image as a full-color background with the mission name and countdown overlaid.
+- **Clock** — Firefly logo, a large 24-hour clock (US Central time), the date, and current weather for Briggs, TX (Firefly's test site).
 
 ## Hardware
 

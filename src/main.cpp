@@ -1,6 +1,7 @@
 // Firefly Aerospace next-launch display for M5Stack M5Tough.
-// Data: The Space Devs Launch Library 2 API (Firefly only).
-// Two views (Mission Control / Hero) that auto-rotate and toggle on touch.
+// Data: The Space Devs Launch Library 2 (launch) + Open-Meteo (weather).
+// Three views (Mission Control / Hero / Clock+Weather) that auto-rotate and
+// toggle on touch.
 
 #include <M5Unified.h>
 #include <WiFi.h>
@@ -14,20 +15,31 @@
 #include "secrets.h"  // optional, gitignored: #define WIFI_SSID / WIFI_PASS
 #endif
 
+#include "logo_firefly.h"  // firefly_logo_png[] (64x64)
+
 // ---- Config ----
 static const char* LL2_URL =
     "https://ll.thespacedevs.com/2.2.0/launch/upcoming/"
     "?search=Firefly&limit=1&mode=normal";
 static const char* AP_NAME = "Firefly-Display-Setup";
-static const uint32_t FETCH_INTERVAL_MS = 2UL * 60UL * 60UL * 1000UL; // 2h
+// Weather: Briggs, TX (Firefly's test/manufacturing site). Central time.
+static const char* WEATHER_URL =
+    "https://api.open-meteo.com/v1/forecast"
+    "?latitude=30.878&longitude=-97.935"
+    "&current=temperature_2m,weather_code"
+    "&temperature_unit=fahrenheit&timezone=America%2FChicago";
+static const char* WEATHER_PLACE = "Briggs, TX";
+static const char* TZ_POSIX = "CST6CDT,M3.2.0,M11.1.0";  // US Central w/ DST
+static const uint32_t FETCH_INTERVAL_MS = 30UL * 60UL * 1000UL;  // 30 min
 static const uint32_t VIEW_SWITCH_MS = 8000;
 static const uint32_t COUNTDOWN_TICK_MS = 1000;
 static const uint32_t RETRY_INTERVAL_MS = 30000;  // retry fast until data loads
 static const int IMG_MAX_BYTES = 600000;
+static const int NUM_VIEWS = 3;
 
 // ---- Colors (RGB565) ----
 static constexpr uint16_t COL_BG = 0x0000;
-static constexpr uint16_t COL_ORANGE = 0xFD20;
+static constexpr uint16_t COL_FIREFLY = 0xD6E9;  // #D4DF4C "Wattle" brand green
 static constexpr uint16_t COL_WHITE = 0xFFFF;
 static constexpr uint16_t COL_GREY = 0x8410;
 static constexpr uint16_t COL_GREEN = 0x07E0;
@@ -49,8 +61,15 @@ struct LaunchData {
 };
 static LaunchData g_launch;
 
+struct WeatherData {
+    float temp;
+    int code;
+    bool valid;
+};
+static WeatherData g_weather;
+
 // ---- State ----
-static int g_view = 0;  // 0 = Mission Control, 1 = Hero
+static int g_view = 0;  // 0 = Mission Control, 1 = Hero, 2 = Clock+Weather
 static uint32_t g_lastSwitch = 0;
 static uint32_t g_lastFetch = 0;
 static uint32_t g_lastTick = 0;
@@ -59,18 +78,22 @@ static uint8_t* g_img = nullptr;
 static size_t g_imgLen = 0;
 
 // ---- Helpers ----
+// Convert a UTC broken-down time to epoch, independent of the system TZ
+// (so it stays correct even though the clock is set to Central time).
+static time_t utcToEpoch(int Y, int M, int D, int h, int mi, int se) {
+    static const int cum[] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
+    long days = (Y - 1970) * 365L + (Y - 1969) / 4 - (Y - 1901) / 100 +
+                (Y - 1601) / 400;
+    days += cum[(M - 1) % 12] + (D - 1);
+    if (M > 2 && ((Y % 4 == 0 && Y % 100 != 0) || Y % 400 == 0)) days += 1;
+    return ((time_t)days * 24 + h) * 3600 + mi * 60 + se;
+}
+
 static time_t parseISO8601(const String& s) {
     int Y, M, D, h, mi, se;
     if (sscanf(s.c_str(), "%d-%d-%dT%d:%d:%dZ", &Y, &M, &D, &h, &mi, &se) != 6)
         return 0;
-    struct tm tm = {};
-    tm.tm_year = Y - 1900;
-    tm.tm_mon = M - 1;
-    tm.tm_mday = D;
-    tm.tm_hour = h;
-    tm.tm_min = mi;
-    tm.tm_sec = se;
-    return mktime(&tm);  // TZ is UTC (configTime(0,0,...)), so == timegm
+    return utcToEpoch(Y, M, D, h, mi, se);
 }
 
 static String formatCountdown(time_t now, time_t net) {
@@ -102,17 +125,17 @@ static uint16_t statusColor(const String& ab) {
     return COL_YELLOW;
 }
 
-// Route the launch image through images.weserv.nl: it re-encodes to a
-// baseline JPEG (the M5 decoder can't handle progressive) and pre-scales it
-// to the screen, so we just drawJpg it 1:1.
-static String weservUrl(const String& src) {
+// Route images through images.weserv.nl: it re-encodes to a baseline JPEG
+// (the M5 decoder can't handle progressive) and pre-scales to the given size,
+// so we just drawJpg the result. bg=000000 matches the screen for "contain".
+static String weservUrl(const String& src, int w, int h, const char* fit) {
     String s = src;
     if (s.startsWith("https://"))
         s = s.substring(8);
     else if (s.startsWith("http://"))
         s = s.substring(7);
-    return "https://images.weserv.nl/?url=ssl:" + s +
-           "&w=320&h=150&fit=cover&output=jpg";
+    return "https://images.weserv.nl/?url=ssl:" + s + "&w=" + w + "&h=" + h +
+           "&fit=" + fit + "&bg=000000&output=jpg";
 }
 
 // ---- Network ----
@@ -120,7 +143,7 @@ static void connectWiFi() {
     auto& d = M5.Display;
     d.fillScreen(COL_BG);
     d.setTextDatum(middle_center);
-    d.setTextColor(COL_ORANGE, COL_BG);
+    d.setTextColor(COL_FIREFLY, COL_BG);
     d.setTextSize(2);
     d.drawString("Connecting WiFi...", d.width() / 2, d.height() / 2 - 24);
     d.setTextSize(1);
@@ -141,7 +164,7 @@ static void connectWiFi() {
         if (WiFi.status() == WL_CONNECTED) break;
         d.fillScreen(COL_BG);
         d.setTextDatum(middle_center);
-        d.setTextColor(COL_ORANGE, COL_BG);
+        d.setTextColor(COL_FIREFLY, COL_BG);
         d.setTextSize(2);
         d.drawString("Connecting WiFi...", 160, 86);
         d.setTextColor(COL_WHITE, COL_BG);
@@ -164,7 +187,9 @@ static void connectWiFi() {
 }
 
 static void syncTime() {
-    configTime(0, 0, "pool.ntp.org", "time.google.com");
+    // Central time for the on-screen clock; epoch parsing stays UTC via
+    // utcToEpoch(), so the countdown is unaffected by the TZ.
+    configTzTime(TZ_POSIX, "pool.ntp.org", "time.google.com");
     struct tm t;
     bool ok = false;
     for (int i = 0; i < 12 && !(ok = getLocalTime(&t, 500)); i++) {
@@ -227,40 +252,27 @@ static bool fetchLaunch() {
     return true;
 }
 
-static void downloadImage() {
-    if (g_launch.image.length() == 0) return;
-    if (g_img) {
-        free(g_img);
-        g_img = nullptr;
-        g_imgLen = 0;
-    }
+static bool downloadToPsram(const String& url, uint8_t** outBuf, size_t* outLen) {
     WiFiClientSecure client;
     client.setInsecure();
     HTTPClient https;
     https.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    String url = weservUrl(g_launch.image);
-    Serial.printf("[IMG] url %s\n", url.c_str());
     if (!https.begin(client, url)) {
-        Serial.println("[IMG] https.begin failed");
-        return;
+        Serial.println("[DL] https.begin failed");
+        return false;
     }
     int code = https.GET();
     int len = https.getSize();
-    Serial.printf("[IMG] GET -> %d, size=%d\n", code, len);
-    if (code != 200) {
+    Serial.printf("[DL] GET -> %d, size=%d\n", code, len);
+    if (code != 200 || len <= 0 || len > IMG_MAX_BYTES) {
         https.end();
-        return;
-    }
-    if (len <= 0 || len > IMG_MAX_BYTES) {
-        Serial.println("[IMG] size out of range, skipping");
-        https.end();
-        return;
+        return false;
     }
     uint8_t* buf = (uint8_t*)ps_malloc(len);
     if (!buf) {
-        Serial.println("[IMG] ps_malloc failed");
+        Serial.println("[DL] ps_malloc failed");
         https.end();
-        return;
+        return false;
     }
     WiFiClient* stream = https.getStreamPtr();
     int got = 0;
@@ -274,13 +286,84 @@ static void downloadImage() {
         }
     }
     https.end();
-    Serial.printf("[IMG] downloaded %d/%d bytes\n", got, len);
-    if (got == len) {
-        g_img = buf;
-        g_imgLen = len;
-    } else {
+    Serial.printf("[DL] %d/%d bytes\n", got, len);
+    if (got != len) {
         free(buf);
+        return false;
     }
+    *outBuf = buf;
+    *outLen = len;
+    return true;
+}
+
+static void downloadImage() {
+    if (g_launch.image.length() == 0) return;
+    if (g_img) {
+        free(g_img);
+        g_img = nullptr;
+        g_imgLen = 0;
+    }
+    String url = weservUrl(g_launch.image, 320, 150, "cover");
+    Serial.printf("[IMG] %s\n", url.c_str());
+    downloadToPsram(url, &g_img, &g_imgLen);
+}
+
+static const char* wmoText(int code) {
+    switch (code) {
+        case 0: return "Clear";
+        case 1: return "Mainly clear";
+        case 2: return "Partly cloudy";
+        case 3: return "Overcast";
+        case 45:
+        case 48: return "Fog";
+        case 51:
+        case 53:
+        case 55: return "Drizzle";
+        case 61:
+        case 63:
+        case 65: return "Rain";
+        case 66:
+        case 67: return "Freezing rain";
+        case 71:
+        case 73:
+        case 75: return "Snow";
+        case 77: return "Snow grains";
+        case 80:
+        case 81:
+        case 82: return "Showers";
+        case 85:
+        case 86: return "Snow showers";
+        case 95: return "Thunderstorm";
+        case 96:
+        case 99: return "Thunderstorm";
+        default: return "--";
+    }
+}
+
+static bool fetchWeather() {
+    if (WiFi.status() != WL_CONNECTED) return false;
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient https;
+    https.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    if (!https.begin(client, WEATHER_URL)) return false;
+    int code = https.GET();
+    Serial.printf("[WX] GET -> %d\n", code);
+    if (code != 200) {
+        https.end();
+        return false;
+    }
+    String payload = https.getString();
+    https.end();
+    JsonDocument doc;
+    if (deserializeJson(doc, payload)) return false;
+    JsonObject cur = doc["current"];
+    if (cur.isNull()) return false;
+    g_weather.temp = cur["temperature_2m"] | 0.0f;
+    g_weather.code = cur["weather_code"] | -1;
+    g_weather.valid = true;
+    Serial.printf("[WX] %.1fF code=%d\n", g_weather.temp, g_weather.code);
+    return true;
 }
 
 // ---- Views ----
@@ -288,7 +371,7 @@ static void drawCountdownMC(time_t now) {
     auto& d = M5.Display;
     d.fillRect(0, 40, 320, 32, COL_BG);
     d.setTextDatum(middle_center);
-    d.setTextColor(COL_ORANGE, COL_BG);
+    d.setTextColor(COL_FIREFLY, COL_BG);
     d.setTextSize(3);
     d.drawString(formatCountdown(now, g_launch.net), 160, 56);
 }
@@ -296,8 +379,8 @@ static void drawCountdownMC(time_t now) {
 static void drawMissionControl(time_t now) {
     auto& d = M5.Display;
     d.fillScreen(COL_BG);
-    d.fillRect(0, 0, 320, 26, COL_ORANGE);
-    d.setTextColor(COL_BG, COL_ORANGE);
+    d.fillRect(0, 0, 320, 26, COL_FIREFLY);
+    d.setTextColor(COL_BG, COL_FIREFLY);
     d.setTextDatum(middle_left);
     d.setTextSize(2);
     d.drawString("FIREFLY", 8, 13);
@@ -343,7 +426,7 @@ static void drawCountdownHero(time_t now) {
     auto& d = M5.Display;
     d.fillRect(0, 206, 320, 28, COL_BG);
     d.setTextDatum(bottom_left);
-    d.setTextColor(COL_ORANGE, COL_BG);
+    d.setTextColor(COL_FIREFLY, COL_BG);
     d.setTextSize(3);
     d.drawString(formatCountdown(now, g_launch.net), 8, 234);
 }
@@ -372,18 +455,91 @@ static void drawHero(time_t now) {
     drawCountdownHero(now);
 }
 
+// "<place>  NN`F" centered at cx, degree drawn as a small ring (font-agnostic).
+static void drawTemp(int cx, int y) {
+    auto& d = M5.Display;
+    char head[40];
+    snprintf(head, sizeof(head), "%s  %d", WEATHER_PLACE,
+             (int)lroundf(g_weather.temp));
+    d.setTextSize(2);
+    int wHead = d.textWidth(head);
+    int wTail = d.textWidth("F");
+    int total = wHead + 7 + wTail;
+    int x = cx - total / 2;
+    d.setTextDatum(top_left);
+    d.setTextColor(COL_WHITE, COL_BG);
+    d.drawString(head, x, y);
+    int dx = x + wHead + 3;
+    d.drawCircle(dx, y + 3, 2, COL_WHITE);
+    d.drawString("F", dx + 6, y);
+}
+
+static void drawClockTime() {
+    auto& d = M5.Display;
+    struct tm lt;
+    bool ok = getLocalTime(&lt, 50);
+    char hhmm[8];
+    if (ok)
+        strftime(hhmm, sizeof(hhmm), "%H:%M", &lt);
+    else
+        strcpy(hhmm, "--:--");
+    d.fillRect(0, 72, 320, 56, COL_BG);
+    d.setFont(&fonts::Font7);
+    d.setTextSize(1);  // fixed: prevents a leftover size from ghosting
+    d.setTextColor(COL_FIREFLY, COL_BG);
+    d.setTextDatum(middle_center);
+    d.drawString(hhmm, 160, 100);
+    d.setFont(&fonts::Font0);
+    d.setTextSize(1);
+}
+
+static void drawClock() {
+    auto& d = M5.Display;
+    d.fillScreen(COL_BG);
+
+    d.drawPng(firefly_logo_png, firefly_logo_png_len, 128, 4);  // 64x64 logo
+
+    drawClockTime();
+
+    struct tm lt;
+    char date[28] = "";
+    if (getLocalTime(&lt, 50)) strftime(date, sizeof(date), "%a %b %d %Y", &lt);
+    d.setFont(&fonts::Font0);
+    d.setTextDatum(top_center);
+    d.setTextSize(2);
+    d.setTextColor(COL_WHITE, COL_BG);
+    d.drawString(date, 160, 138);
+
+    if (g_weather.valid) {
+        drawTemp(160, 168);
+        d.setTextDatum(top_center);
+        d.setTextSize(1);
+        d.setTextColor(COL_FIREFLY, COL_BG);
+        d.drawString(wmoText(g_weather.code), 160, 198);
+    } else {
+        d.setTextDatum(top_center);
+        d.setTextSize(1);
+        d.setTextColor(COL_GREY, COL_BG);
+        d.drawString("weather unavailable", 160, 175);
+    }
+}
+
 static void render(bool full) {
     time_t now = time(nullptr);
     if (full) {
         if (g_view == 0)
             drawMissionControl(now);
-        else
+        else if (g_view == 1)
             drawHero(now);
+        else
+            drawClock();
     } else {
         if (g_view == 0)
             drawCountdownMC(now);
-        else
+        else if (g_view == 1)
             drawCountdownHero(now);
+        else
+            drawClockTime();
     }
 }
 
@@ -415,12 +571,13 @@ void setup() {
 
     M5.Display.fillScreen(COL_BG);
     M5.Display.setTextDatum(middle_center);
-    M5.Display.setTextColor(COL_ORANGE, COL_BG);
+    M5.Display.setTextColor(COL_FIREFLY, COL_BG);
     M5.Display.setTextSize(2);
     M5.Display.drawString("Loading launch...", 160, 120);
 
     fetchLaunch();
     downloadImage();
+    fetchWeather();
 
     uint32_t t = millis();
     g_lastFetch = t;
@@ -434,13 +591,13 @@ void loop() {
 
     auto t = M5.Touch.getDetail();
     if (t.wasPressed()) {
-        g_view ^= 1;
+        g_view = (g_view + 1) % NUM_VIEWS;
         g_lastSwitch = millis();
         g_fullRedraw = true;
     }
 
     if (millis() - g_lastSwitch >= VIEW_SWITCH_MS) {
-        g_view ^= 1;
+        g_view = (g_view + 1) % NUM_VIEWS;
         g_lastSwitch = millis();
         g_fullRedraw = true;
     }
@@ -449,6 +606,7 @@ void loop() {
     if (millis() - g_lastFetch >= fetchEvery) {
         if (time(nullptr) < 1000000000L) syncTime();  // retry NTP if not set
         if (fetchLaunch()) downloadImage();
+        fetchWeather();
         g_lastFetch = millis();
         g_fullRedraw = true;
     }
