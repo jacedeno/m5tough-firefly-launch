@@ -36,11 +36,23 @@ Credentials are managed with [WiFiManager](https://github.com/tzapu/WiFiManager)
 
 **To change networks** (e.g. moving from home to the office): **hold a finger on the screen while powering on** to wipe the saved credentials and reopen the setup portal.
 
+### Optional: preset credentials
+
+To skip the portal (handy on a network without a captive portal), create `src/secrets.h` — it is gitignored and never committed:
+
+```cpp
+#pragma once
+#define WIFI_SSID "your-network"
+#define WIFI_PASS "your-password"
+```
+
+When present, the device connects directly to that network and retries until it succeeds. Delete the file to fall back to the WiFiManager portal.
+
 ## How it works
 
 - On boot the device connects to Wi-Fi, syncs the clock via NTP (UTC), and fetches the next Firefly launch.
 - Launch data is refreshed every 2 hours (the API has a low anonymous rate limit, so polling is intentionally infrequent). The countdown ticks every second from the local clock, so it stays smooth between refreshes.
-- The HTTP response is parsed with an ArduinoJson filter to keep only the fields the display needs.
+- The mission image is fetched through [images.weserv.nl](https://images.weserv.nl/), a free image proxy that re-encodes it to a **baseline** JPEG and resizes it to the screen. This is required because the display's JPEG decoder cannot handle the progressive JPEGs the launch API serves.
 
 Because Firefly launches are infrequent, the next launch is usually weeks or months out and may show a tentative (`TBD`) date — so the countdown is shown in days/hours rather than a dramatic seconds count.
 
