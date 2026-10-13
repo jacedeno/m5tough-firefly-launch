@@ -32,7 +32,7 @@ The screen alternates between three views every 8 seconds, and you can tap the t
 ### How it works
 
 - On boot the device connects to Wi-Fi, syncs the clock via NTP (UTC), and fetches the next Firefly launch.
-- Launch data is refreshed every 2 hours (the API has a low anonymous rate limit, so polling is intentionally infrequent). The countdown ticks every second from the local clock, so it stays smooth between refreshes.
+- Launch data is refreshed every 30 minutes (the API has a low anonymous rate limit, so polling is intentionally infrequent). The countdown ticks every second from the local clock, so it stays smooth between refreshes.
 - The mission image is fetched through [images.weserv.nl](https://images.weserv.nl/), a free image proxy that re-encodes it to a **baseline** JPEG and resizes it to the screen. This is required because the display's JPEG decoder cannot handle the progressive JPEGs the launch API serves.
 
 Because Firefly launches are infrequent, the next launch is usually weeks or months out and may show a tentative (`TBD`) date — so the countdown is shown in days/hours rather than a dramatic seconds count.
@@ -87,7 +87,7 @@ Key constants live at the top of [`src/main.cpp`](src/main.cpp):
 | Constant | Purpose |
 |----------|---------|
 | `LL2_URL` | API query (change `search=Firefly` to track a different provider) |
-| `FETCH_INTERVAL_MS` | How often launch data is refreshed (default 2 h) |
+| `FETCH_INTERVAL_MS` | How often launch data is refreshed (default 30 min) |
 | `VIEW_SWITCH_MS` | Auto-rotate interval between views (default 8 s) |
 | `AP_NAME` | Wi-Fi setup access point name |
 
